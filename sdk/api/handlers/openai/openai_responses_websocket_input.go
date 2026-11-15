@@ -178,6 +178,23 @@ func readResponsesWebsocketInput(ctx context.Context, cancel context.CancelCause
 				case errors.Is(errInterrupt, cliproxyexecutor.ErrNoActiveUpstreamWebsocket) && local.deliver(payload):
 					appendResponsesInterruptDiagnostic(timeline, payload, "local_http")
 					continue
+				case errors.Is(errInterrupt, cliproxyexecutor.ErrNoActiveUpstreamWebsocket):
+					// The upstream disappeared before the interrupt could reach it.
+					// A 400 is fatal to Codex; report a transient transport failure
+					// and retire this socket so its normal retry opens a fresh one.
+					appendResponsesInterruptDiagnostic(timeline, payload, "upstream_disconnected")
+					errorPayload, errBuild := buildResponsesWebsocketErrorPayload(&interfaces.ErrorMessage{
+						StatusCode: http.StatusServiceUnavailable,
+						Error:      errors.New(`{"error":{"type":"server_error","code":"upstream_websocket_disconnected","message":"no active upstream websocket for response.interrupt"}}`),
+					})
+					if errBuild != nil {
+						_, _ = writer.closeWithoutError()
+						cancel(errBuild)
+						return
+					}
+					_, _ = writer.closeWithPayload(errorPayload)
+					cancel(cliproxyexecutor.ErrNoActiveUpstreamWebsocket)
+					return
 				default:
 					appendResponsesInterruptDiagnostic(timeline, payload, "rejected")
 					// The sanitized outcome replaces raw error logging here: errors

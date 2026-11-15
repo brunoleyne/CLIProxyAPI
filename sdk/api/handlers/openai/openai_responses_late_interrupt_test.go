@@ -143,7 +143,9 @@ func TestResponsesLateInterruptDoesNotPoisonNextCreate(t *testing.T) {
 	send(fmt.Sprintf(`{"type":"response.create","model":%q,"input":[]}`, model))
 	expect("response.created", "r1")
 	expect("response.completed", "r1")
-	send(`{"type":"response.interrupt","response_id":"unknown"}`)
+	// Malformed control frames remain recoverable on this socket; a missing
+	// upstream connection instead closes it so Codex can reconnect.
+	send(`{"type":"response.interrupt"}`)
 	expect("error", "")
 	send(`{"type":"response.interrupt","response_id":"r1","mode":"discard_partial_items"}`)
 	send(fmt.Sprintf(`{"type":"response.create","model":%q,"previous_response_id":"r1","input":[]}`, model))
@@ -236,7 +238,7 @@ func TestResponsesInterruptDiagnosticsAreSanitized(t *testing.T) {
 	clientClosed = true
 	select {
 	case timeline := <-timelines:
-		for _, event := range []string{"Event: websocket.interrupt", "Event: websocket.interrupt.outcome", `"outcome":"rejected"`} {
+		for _, event := range []string{"Event: websocket.interrupt", "Event: websocket.interrupt.outcome", `"outcome":"upstream_disconnected"`} {
 			if !strings.Contains(timeline, event) {
 				t.Errorf("missing %s in timeline: %s", event, timeline)
 			}

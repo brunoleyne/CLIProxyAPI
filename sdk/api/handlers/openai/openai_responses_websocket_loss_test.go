@@ -38,12 +38,13 @@ type lossFixture struct {
 	connections atomic.Int32
 	creates     atomic.Int32
 	authIDs     sync.Map
+	sessionDone chan struct{}
 }
 
 // access, when given, authenticates the client with the header "Bearer key-1" on every turn.
 func newLossFixture(t *testing.T, steering bool, script func(index int, c *websocket.Conn, read func() []byte), access ...sdkaccess.Provider) *lossFixture {
 	t.Helper()
-	f := &lossFixture{t: t}
+	f := &lossFixture{t: t, sessionDone: make(chan struct{}, 1)}
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		index := int(f.connections.Add(1))
 		f.authIDs.Store(index, r.Header.Get("Authorization"))
@@ -104,7 +105,13 @@ func newLossFixture(t *testing.T, steering bool, script func(index int, c *webso
 		header.Set("Authorization", "Bearer key-1")
 	}
 	router := gin.New()
-	router.GET("/v1/responses", h.ResponsesWebsocket)
+	router.GET("/v1/responses", func(c *gin.Context) {
+		h.ResponsesWebsocket(c)
+		select {
+		case f.sessionDone <- struct{}{}:
+		default:
+		}
+	})
 	downstream := httptest.NewServer(router)
 	t.Cleanup(downstream.Close)
 	client, resp, errDial := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(downstream.URL, "http")+"/v1/responses", header)
@@ -452,13 +459,16 @@ func (h *turn2BarrierModelRouterHost) RouteModel(_ context.Context, _ pluginapi.
 	return pluginapi.ModelRouteResponse{}, false
 }
 
-// In non-steering mode, a second response.create queued while turn 1 is active must be fenced
-// with upstream_websocket_not_sent even when the idle EOF arrives after the handler's epoch check,
-// and rejecting that stale input must not fence a third create sent after the EOF.
+// An interrupt after idle EOF must retire the downstream even if stale creates
+// are queued behind a blocked route decision. Neither queued create may reach
+// an account; the client must reconnect and explicitly send its next request.
 func TestResponsesWebsocketQueuedInputBeforeIdleEOFIsNotSent(t *testing.T) {
 	turn2Reached := make(chan struct{})
 	eofProcessed := make(chan struct{})
 	releaseTurn2 := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseRoute := func() { releaseOnce.Do(func() { close(releaseTurn2) }) }
+	defer releaseRoute()
 	f := newLossFixture(t, false, func(index int, c *websocket.Conn, read func() []byte) {
 		read()
 		if index == 1 {
@@ -492,23 +502,42 @@ func TestResponsesWebsocketQueuedInputBeforeIdleEOFIsNotSent(t *testing.T) {
 	f.awaitCompleted()
 	<-eofProcessed
 
-	// Queue c3 after the EOF (epoch 1) while c2 is still blocked in RouteModel; the rejected
-	// interrupt proves readResponsesWebsocketInput has already stamped and queued c3.
+	// Queue c3 after the EOF while c2 is still blocked in RouteModel. The
+	// following interrupt proves the reader has already queued c3, then closes
+	// this downstream with a retryable failure rather than an unrecoverable 400.
 	f.create(`,"event_id":"c3"`)
 	f.send(`{"type":"response.interrupt","response_id":"r1"}`)
-	if interruptErr := f.nextError(); ojson.GetBytesNoCopy(interruptErr, "status").Int() != http.StatusBadRequest {
-		t.Fatalf("post-EOF interrupt error = %s, want 400", interruptErr)
+	interruptErr := f.nextError()
+	if ojson.GetBytesNoCopy(interruptErr, "status").Int() != http.StatusServiceUnavailable ||
+		ojson.GetBytesNoCopy(interruptErr, "error.type").String() != "server_error" ||
+		ojson.GetBytesNoCopy(interruptErr, "error.code").String() != "upstream_websocket_disconnected" {
+		t.Fatalf("post-EOF interrupt must permit reconnect, got %s", interruptErr)
 	}
-	close(releaseTurn2)
-
-	errFrame := f.nextError()
-	if ojson.GetBytesNoCopy(errFrame, "error.code").String() != "upstream_websocket_not_sent" || ojson.GetBytesNoCopy(errFrame, "error.event_id").String() != "c2" {
-		t.Fatalf("queued create after idle EOF = %s, want upstream_websocket_not_sent for c2", errFrame)
+	if _, extra, errRead := f.client.ReadMessage(); errRead == nil {
+		t.Fatalf("post-EOF socket remained open after retryable error: %s", extra)
+	}
+	releaseRoute()
+	select {
+	case <-f.sessionDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("lost session did not finish after its route decision was released")
+	}
+	if f.connections.Load() != 1 || f.creates.Load() != 1 {
+		t.Fatalf("connections=%d creates=%d, want only c1 before reconnect", f.connections.Load(), f.creates.Load())
 	}
 
+	// A new downstream must accept a fresh create, without replaying c2 or c3
+	// from the retired socket into this account or another one.
+	client, _, errDial := websocket.DefaultDialer.Dial("ws://"+f.client.RemoteAddr().String()+"/v1/responses", nil)
+	if errDial != nil {
+		t.Fatal(errDial)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	f.client = client
+	f.create(`,"event_id":"c3"`)
 	f.awaitCompleted()
 	if f.connections.Load() != 2 || f.creates.Load() != 2 {
-		t.Fatalf("connections=%d creates=%d, want 2 and 2 (c1 and c3 only)", f.connections.Load(), f.creates.Load())
+		t.Fatalf("connections=%d creates=%d, want 2 and 2 (c1 and explicitly retried c3 only)", f.connections.Load(), f.creates.Load())
 	}
 }
 

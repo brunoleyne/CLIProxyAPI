@@ -29,8 +29,9 @@ import (
 
 // TestResponsesInterruptInFlight verifies that a Codex response.interrupt sent while
 // generation is running is forwarded unchanged to the current upstream socket, and that
-// the same socket accepts the next response.create. Idle, malformed, and disabled-auth
-// interrupts must fail locally without opening or writing that socket.
+// the same socket accepts the next response.create. Malformed and disabled-auth
+// interrupts fail locally; an idle interrupt resets the downstream for retry
+// without opening an upstream connection.
 func TestResponsesInterruptInFlight(t *testing.T) {
 	for _, steering := range []bool{false, true} {
 		t.Run(fmt.Sprintf("steering_%t", steering), func(t *testing.T) {
@@ -123,7 +124,7 @@ func TestResponsesInterruptInFlight(t *testing.T) {
 					t.Fatal(errSend)
 				}
 			}
-			expect := func(event string) {
+			expect := func(event string) []byte {
 				t.Helper()
 				_, payload, errRead := client.ReadMessage()
 				if errRead != nil {
@@ -132,15 +133,24 @@ func TestResponsesInterruptInFlight(t *testing.T) {
 				if got := ojson.GetBytesNoCopy(payload, "type").String(); got != event {
 					t.Fatalf("expected %s, got %s", event, payload)
 				}
+				return payload
 			}
 
 			send([]byte(`{"type":"response.interrupt"}`))
 			expect("error")
 			send(interrupt)
-			expect("error")
+			if payload := expect("error"); ojson.GetBytesNoCopy(payload, "status").Int() != http.StatusServiceUnavailable {
+				t.Fatalf("idle interrupt must permit reconnect: %s", payload)
+			}
 			if connections.Load() != 0 {
 				t.Fatal("idle interrupt opened an upstream connection")
 			}
+			_ = client.Close()
+			client, _, errDial = websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(downstream.URL, "http")+"/v1/responses", nil)
+			if errDial != nil {
+				t.Fatal(errDial)
+			}
+			_ = client.SetReadDeadline(time.Now().Add(8 * time.Second))
 
 			send([]byte(fmt.Sprintf(`{"type":"response.create","model":%q,"input":[]}`, model)))
 			expect("response.created")

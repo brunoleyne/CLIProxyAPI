@@ -124,25 +124,25 @@ func TestResponsesInterruptRacingWebsocketLossIsNotAnsweredLocally(t *testing.T)
 	close(executor.lost)
 	send(`{"type":"response.interrupt","response_id":"r-ws"}`)
 
-	// The next downstream message must be the upstream-loss notice, never a
-	// locally fabricated incomplete for r-ws. If the interrupt had been
-	// claimed locally, the forward loop would have cancelled the executor
-	// context and written that incomplete before the loss terminal could
-	// be delivered, so observing the loss notice first also proves the
-	// frame was never locally answered.
-	deadline := time.Now().Add(8 * time.Second)
-	for time.Now().Before(deadline) {
-		_, payload, errNext := client.ReadMessage()
-		if errNext != nil {
-			t.Fatalf("waiting for upstream loss notice: %v", errNext)
-		}
-		eventType := ojson.GetBytesNoCopy(payload, "type").String()
-		if eventType == "response.incomplete" {
-			t.Fatalf("fabricated local incomplete after websocket loss: %s", payload)
-		}
-		if eventType == "error" && ojson.GetBytesNoCopy(payload, "error.event_id").String() == "evt-loss" {
-			return
-		}
+	// Either the executor reports its correlated loss first, or the reader
+	// observes the missing connection and closes with a retryable 503. Neither
+	// path may fabricate a local incomplete or poison the retry with a 400.
+	_, payload, errNext := client.ReadMessage()
+	if errNext != nil {
+		t.Fatalf("waiting for upstream loss notice: %v", errNext)
 	}
-	t.Fatal("upstream loss notice was not observed")
+	if got := ojson.GetBytesNoCopy(payload, "type").String(); got != "error" {
+		t.Fatalf("expected upstream loss error, got %s", payload)
+	}
+	if got := ojson.GetBytesNoCopy(payload, "status").Int(); got == http.StatusBadRequest {
+		t.Fatalf("upstream loss returned a non-retryable 400: %s", payload)
+	}
+	if ojson.GetBytesNoCopy(payload, "error.event_id").String() == "evt-loss" {
+		return
+	}
+	if ojson.GetBytesNoCopy(payload, "status").Int() != http.StatusServiceUnavailable ||
+		ojson.GetBytesNoCopy(payload, "error.type").String() != "server_error" ||
+		ojson.GetBytesNoCopy(payload, "error.code").String() != "upstream_websocket_disconnected" {
+		t.Fatalf("uncorrelated upstream loss must be retryable: %s", payload)
+	}
 }
